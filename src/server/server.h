@@ -9,6 +9,8 @@
 #include "config.h"
 #include "session.h"
 #include "cmd_parse.h"
+#include "msg.h"
+#include "file_db.h"
 
 #define MAX_EVENTS 32 // 最大事件数
 

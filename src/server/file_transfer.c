@@ -68,30 +68,46 @@ static int calculate_file_sha256_evp(int fd, off_t offset, off_t length, char *s
     return 0;
 }
 
-// 循环接收n字节
-static int recvn(int sockfd, void *buf, ssize_t n) {
-    ssize_t sret;
-    char *p = (char *)buf; // void *不能做偏移
-    ssize_t cursize = 0;
-    while (cursize < n) {
-        sret = recv(sockfd, p + cursize, n - cursize, 0);
-        if (sret <= 0) {
-            return sret;
-        }
-        cursize += sret;
+// 辅助函数：根据用户当前目录和请求的文件名构造完整的虚拟路径。
+static void construct_virtual_path(UserInfo *user, const char *filename, char *virtual_path,
+                                   size_t size) {
+    if (strcmp(user->current_dir, "/") == 0) {
+        snprintf(virtual_path, size, "/%s", filename);
+    } else {
+        snprintf(virtual_path, size, "%s/%s", user->current_dir, filename);
     }
-    return cursize;
 }
 
 // 文件下载
 void handle_gets(void *arg) {
+
     FileTransferArg *transfer_arg = (FileTransferArg *)arg;
     UserInfo *user = &transfer_arg->user;
+    MYSQL *conn = transfer_arg->conn;
     char *filename = transfer_arg->filename;
 
-    // 构建文件路径
-    char file_path[PATH_MAX + 1] = {0};
-    snprintf(file_path, sizeof(file_path), "%s/%s", user->current_dir, filename);
+    // 构建虚拟文件路径
+    char virtual_path[PATH_MAX] = {0};
+    construct_virtual_path(user, filename, virtual_path, sizeof(virtual_path));
+
+    // 获取用户id
+    int user_id = get_user_id(conn, user->username);
+    if (user_id < 0) {
+        send_msg(user->control_sockfd, "ERROR: User not found in database\n");
+        free(transfer_arg);
+        return;
+    }
+    // 根据用户ID和虚拟路径查询数据库中的文件记录
+    FileRecord record;
+    if (file_db_get_record_by_path(conn, user_id, virtual_path, &record) != 0) {
+        send_msg(user->control_sockfd, "ERROR: File not found in virtual file table\n");
+        free(transfer_arg);
+        return;
+    }
+
+    // 构造物理文件路径:upload_dir/sha256
+    char file_path[PATH_MAX] = {0};
+    snprintf(file_path, sizeof(file_path), "%s/%s", user->upload_dir, record.sha256);
 
     // 打开文件
     int fd = open(file_path, O_RDONLY);
@@ -333,7 +349,10 @@ void handle_gets(void *arg) {
 void handle_puts(void *arg) {
     FileTransferArg *transfer_arg = (FileTransferArg *)arg;
     UserInfo *user = &transfer_arg->user;
+    MYSQL *conn = transfer_arg->conn;
     char *filename = transfer_arg->filename;
+
+    printf("Handling PUTS %s for user %s\n", filename, user->username);
 
     Train train;
     // 接收文件名
@@ -362,6 +381,7 @@ void handle_puts(void *arg) {
         return;
     }
     train.data[train.length - 1] = '\0';
+    printf("FILE NAME: %s\n",train.data);
     // 检查文件名是否匹配
     if (strcmp(train.data, filename) != 0) {
         send_msg(user->control_sockfd, "file name mismatch\n");
@@ -369,9 +389,6 @@ void handle_puts(void *arg) {
         free(transfer_arg);
         return;
     }
-    // 构建保存文件的路径
-    char file_path[PATH_MAX + 1] = {0};
-    snprintf(file_path, sizeof(file_path), "%s/%s", user->upload_dir, filename);
 
     // 接收文件大小
     ret = recvn(user->data_sockfd, &train.length, sizeof(train.length));
@@ -399,7 +416,79 @@ void handle_puts(void *arg) {
         free(transfer_arg);
         return;
     }
+    printf("FILE SIZE = %ld\n",file_size);
+    // 接收客户端发送的文件全局SHA-256值
+    ret = recvn(user->data_sockfd, &train.length, sizeof(train.length));
+    if (ret <= 0) {
+        if (ret == 0) {
+            printf("peer closed data connection\n");
+            CLOUDISK_LOG_INFO("%s closed data connection", user->username);
+        } else {
+            send_err_msg(user->control_sockfd, "recv SHA-256 length");
+            CLOUDISK_LOG_ERROR_CHECK("recv SHA-256 length");
+        }
+        free(transfer_arg);
+        return;
+    }
+    char client_hash[SHA256_STR_LEN + 1] = {0};
+    ret = recvn(user->data_sockfd, client_hash, train.length);
+    if (ret <= 0) {
+        if (ret == 0) {
+            printf("peer closed data connection\n");
+            CLOUDISK_LOG_INFO("%s closed data connection", user->username);
+        } else {
+            send_err_msg(user->control_sockfd, "recv SHA-256");
+            CLOUDISK_LOG_ERROR_CHECK("recv SHA-256");
+        }
+        free(transfer_arg);
+        return;
+    }
+    client_hash[train.length] = '\0';
+    printf("RECV CLIENT HASH: %s\n",client_hash);
+    // 获取用户id
+    int user_id = get_user_id(conn, user->username);
+    printf("user id at line 450 : %d\n",user_id);
+    if (user_id < 0) {
+        send_msg(user->control_sockfd, "ERROR: User not found in database\n");
+        free(transfer_arg);
+        return;
+    }
+    printf("user id at line 455 : %d\n",user_id);
+    // 获取当前目录的id，作为上传文件的父目录id
+    int parent_id = get_dir_id(conn, user_id, user->current_dir);
+    if (parent_id < 0) {
+        // 当前目录没有记录
+        parent_id = 0;
+    }
+    printf("[handle_puts] user_id = %d, parent_id = %d\n",user_id,parent_id);
 
+    // 秒传检测，查询是否已存在相同hash的文件记录
+    FileRecord existing;
+    if (file_db_find_by_hash(conn, client_hash, &existing) == 0) {
+        // 已存在，只在虚拟文件表插入一条记录
+        FileRecord new_record;
+        memset(&new_record, 0, sizeof(new_record));
+        new_record.user_id = user_id;
+        new_record.parent_id = parent_id;
+        strncpy(new_record.filename, filename, FILENAME_SIZE - 1);
+        snprintf(new_record.path, sizeof(new_record.path), "%s/%s", user->current_dir, filename);
+        new_record.type = 'f';
+        new_record.filesize = file_size;
+        strncpy(new_record.sha256, client_hash, SHA256_STR_LEN);
+        if (file_db_create_record(conn, &new_record) != 0) {
+            send_msg(user->control_sockfd, "ERROR: Insert file record failed\n");
+            free(transfer_arg);
+            return;
+        }
+        send_msg(user->control_sockfd, "OK: File uploaded (instant transfer)\n");
+        free(transfer_arg);
+        return;
+    }
+
+    // 文件不存在，需完整上传，构造物理文件路径：upload_dir/sha256
+    char file_path[PATH_MAX] = {0};
+    snprintf(file_path, sizeof(file_path), "%s/%s", user->upload_dir, client_hash);
+    printf("[handle_puts] file path: %s\n",file_path);
     // 判断该用户的上传目录是否存在，不存在则创建
     struct stat st;
     if (stat(user->upload_dir, &st) == -1) {
@@ -428,6 +517,7 @@ void handle_puts(void *arg) {
 
     // 根据文件大小分情况处理
     if (file_size > LARGE_FILE_THRESHOLD) {
+        printf("BIG FILE\n");
         // 大文件，使用ftruncate+mmap写入
         if (ftruncate(fd, file_size) == -1) {
             send_err_msg(user->control_sockfd, "ftruncate");
@@ -465,6 +555,7 @@ void handle_puts(void *arg) {
         }
         munmap(p, file_size);
     } else {
+        printf("SMALL FILE\n");
         // 小文件,循环直到收到结束标志
         while (1) {
             // 接收数据长度
@@ -510,5 +601,20 @@ void handle_puts(void *arg) {
         }
     }
     close(fd);
+    // 上传结束后，在虚拟文件表中插入记录
+    FileRecord new_record;
+    memset(&new_record, 0, sizeof(new_record));
+    new_record.user_id = user_id;
+    new_record.parent_id = parent_id;
+    strncpy(new_record.filename, filename, FILENAME_SIZE - 1);
+    snprintf(new_record.path, sizeof(new_record.path), "%s/%s", user->current_dir, filename);
+    new_record.type = 'f';
+    new_record.filesize = file_size;
+    strncpy(new_record.sha256, client_hash, SHA256_STR_LEN);
+    if (file_db_create_record(conn, &new_record) != 0) {
+        send_msg(user->control_sockfd, "ERROR: Insert file record failed\n");
+        free(transfer_arg);
+        return;
+    }
     free(transfer_arg);
 }

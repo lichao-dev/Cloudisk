@@ -5,6 +5,7 @@
 #include "config.h"
 #include "session.h"
 #include "file_transfer.h"
+#include "msg.h"
 
 // 任务队列，每个元素组成
 typedef struct{

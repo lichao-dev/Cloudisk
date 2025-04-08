@@ -75,6 +75,14 @@ int load_config(const char *conf_name) {
             config.thread_pool_size = atoi(value);
         } else if (strcmp(key, "task_queue_size") == 0) {
             config.task_queue_size = atoi(value);
+        } else if (strcmp(key, "db_host") == 0) {
+            strncpy(config.db_host, value, sizeof(config.db_host) - 1);
+        } else if (strcmp(key, "db_user") == 0) {
+            strncpy(config.db_user, value, sizeof(config.db_user) - 1);
+        } else if (strcmp(key, "db_pass") == 0) {
+            strncpy(config.db_pass, value, sizeof(config.db_pass) - 1);
+        } else if (strcmp(key, "db_name") == 0) {
+            strncpy(config.db_name, value, sizeof(config.db_name) - 1);
         }
     }
 

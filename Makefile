@@ -27,7 +27,7 @@ CLIENT_BIN = $(BINDIR)client
 # 编译和链接选项
 CC = gcc
 CFLAGS = -Wall -g -I$(INCLUDE_DIR)  # 仍需 -Iinclude，因为 server.h 在这里
-LDFLAGS = -pthread -lcrypt -lssl -lcrypto
+LDFLAGS = -pthread -lcrypt -lssl -lcrypto -lmysqlclient
 
 .PHONY: all clean rebuild depend
 

@@ -107,7 +107,7 @@ static void print_progress(off_t current, off_t total) {
     }
 }
 // 循环接收n字节
-static int recvn(int sockfd, void *buf, ssize_t n) {
+int recvn(int sockfd, void *buf, ssize_t n) {
     ssize_t sret;
     char *p = (char *)buf; // void *不能做偏移
     ssize_t cursize = 0;
@@ -395,6 +395,14 @@ int client_puts(int sockfd, char *filename) {
     }
     off_t file_size = st.st_size;
 
+    // 计算整个文件的 SHA256 值（作为全局哈希，用于秒传检测）
+    char file_hash[SHA256_STR_LEN+1]={0};
+    if(calculate_file_sha256_evp(filename,0,file_size,file_hash)!=0){
+        perror("calculate sha256");
+        close(fd);
+        return -1;
+    }
+
     // 发送文件名
     train.length = strlen(filename) + 1; // 包括末尾的'\0'
     memcpy(train.data, filename, train.length);
@@ -415,8 +423,19 @@ int client_puts(int sockfd, char *filename) {
         return -1;
     }
 
+    printf("SHA256: %s\n",file_hash);
+    // 发送SHA-256值（用于秒传检测）
+    train.length=strlen(file_hash);
+    memcpy(train.data,file_hash,train.length);
+    if(send(sockfd,&train,sizeof(train.length)+train.length,0)==-1){
+        perror("send SHA-256");
+        close(fd);
+        return -1;
+    }
+
     // 发送文件内容
     if (file_size > LARGE_FILE_THRESHOLD) {
+        printf("BIG FILE\n");
         // 大文件
         off_t total_sent = 0; // 总共发送的字节数
         while (total_sent < file_size) {
@@ -436,6 +455,7 @@ int client_puts(int sockfd, char *filename) {
             print_progress(total_sent, file_size);
         }
     } else {
+        printf("SMALL FILE\n");
         // 小文件
         off_t offset = 0;
         while (offset < file_size) {

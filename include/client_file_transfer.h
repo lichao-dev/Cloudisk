@@ -24,6 +24,8 @@ typedef struct {
     TransferType type;
 } FileTransferThreadArg;
 
+// 循环接收n字节
+int recvn(int sockfd, void *buf, ssize_t n);
 // 处理下载文件
 int client_gets(int sockfd, char *filename);
 // 处理上传文件

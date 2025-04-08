@@ -33,17 +33,27 @@ int main(int argc, char *argv[]) {
     } else {
         // 子进程
         close(pipe_fd[1]); // 子进程关闭写端
-        // 加载配置文件
-        load_config(argv[1]);
-
+        
+        signal(SIGPIPE, SIG_IGN);
         signal(SIGINT, SIG_IGN);  // 忽略 SIGINT 信号
         signal(SIGTERM, SIG_IGN); // 忽略 SIGTERM 信号
-        // 获取服务端的默认目录
-        char default_dir[PATH_MAX] = {0};
-        getcwd(default_dir, sizeof(default_dir));
 
+        // 加载配置文件
+        load_config(argv[1]);
         // 初始化线程池
         thread_pool_init();
+        // 初始化数据库
+        MYSQL *conn_db = db_init(config.db_host, config.db_user, config.db_pass, config.db_name);
+        if (conn_db == NULL) {
+            fprintf(stderr, "Failed to initialize database connection.\n");
+            exit(1);
+        }
+        // 创建表
+        if (db_create_tables(conn_db) != 0) {
+            fprintf(stderr, "Failed to create tables.\n");
+            db_close(conn_db);
+            exit(1);
+        }
 
         // 初始化TCP
         int control_fd = tcp_init(config.ip, config.control_port); // 控制连接
@@ -96,7 +106,7 @@ int main(int argc, char *argv[]) {
                     // 设置新连接的用户的信息
                     for (int j = 0; j < config.max_connections; ++j) {
                         if (user[j].state == DISCONNECTION) {
-                            if (handle_control_connection(&user[j], epfd, new_fd) == 0) {
+                            if (handle_control_connection(&user[j], epfd, new_fd, conn_db) == 0) {
                                 user_count++;
                                 printf("The control connection of %s has been established from "
                                        "%s:%d\n",
@@ -115,8 +125,8 @@ int main(int argc, char *argv[]) {
                                                  ntohs(client_addr.sin_port));
                                 close(new_fd);
                             }
-                        }
                         break;
+                        }
                     }
                     continue;
                 }
@@ -151,17 +161,21 @@ int main(int argc, char *argv[]) {
                     int conn_fd = user[j].control_sockfd;
                     if (curr_fd == conn_fd) {
                         memset(cmd_buf, 0, sizeof(cmd_buf));
-                        ssize_t rret = recv(conn_fd, cmd_buf, sizeof(cmd_buf), 0);
-                        ERROR_CHECK(rret, -1, "recv msg");
-                        if (rret == 0) {
+                        Train train;
+                        ssize_t n = recvn(conn_fd, &train.length, sizeof(train.length));
+                        ERROR_CHECK(n, -1, "recv msg length");
+                        n = recvn(conn_fd, cmd_buf, train.length);
+                        ERROR_CHECK(n, -1, "recv msg");
+                        if (n == 0) {
                             printf("%s disconnected.\n", user[j].username);
                             CLOUDISK_LOG_INFO("%s disconnected", user[j].username);
                             close(conn_fd);
                             memset(&user[j], 0, sizeof(user[j]));
                             continue;
                         }
+                        cmd_buf[n] = '\0';
                         printf("server.c cmd_buf = %s\n", cmd_buf);
-                        cmd_parse(&user[j], cmd_buf);
+                        cmd_parse(&user[j], cmd_buf, conn_db);
                     }
                 }
 
@@ -185,6 +199,7 @@ int main(int argc, char *argv[]) {
                         }
                     }
                     closelog();
+                    db_close(conn_db);
                     exit(EXIT_SUCCESS); // 子进程即主线程退出
                 }
             }
